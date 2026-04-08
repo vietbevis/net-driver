@@ -74,6 +74,9 @@ static char *helper_envp[] = {
 	"HOME=/",
 	"TERM=linux",
 	"PATH=/sbin:/bin:/usr/sbin:/usr/bin",
+	/* Allow nmcli (DBus system bus) from call_usermodehelper */
+	"DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket",
+	"XDG_RUNTIME_DIR=/run",
 	NULL
 };
 
@@ -558,7 +561,8 @@ static void scan_work_fn(struct work_struct *work)
 static void connect_work_fn(struct work_struct *work)
 {
 	struct rtl8188_mon *mon = g_mon;
-	char cmd[1024];
+	/* Large because we build a multi-step /bin/sh script */
+	char *cmd;
 	int n;
 
 	if (!mon->ifname[0]) {
@@ -566,35 +570,147 @@ static void connect_work_fn(struct work_struct *work)
 		return;
 	}
 
+	cmd = kzalloc(4096, GFP_KERNEL);
+	if (!cmd) {
+		set_resp(mon, "ERROR: Out of memory.\n");
+		return;
+	}
+
 	if (mon->cmd_pass[0]) {
 		/* WPA/WPA2: create config, start wpa_supplicant */
-		snprintf(cmd, sizeof(cmd),
-			 "killall wpa_supplicant 2>/dev/null\n"
-			 "cat > /tmp/.rtl8188_wpa.conf << 'WPA'\n"
-			 "ctrl_interface=/var/run/wpa_supplicant\n"
-			 "network={\n"
-			 "    ssid=\"%s\"\n"
-			 "    psk=\"%s\"\n"
-			 "}\n"
-			 "WPA\n"
-			 "wpa_supplicant -B -i %s -c /tmp/.rtl8188_wpa.conf "
-			 "2>&1 > " CONNECT_FILE "\n"
-			 "sleep 3\n"
-			 "dhclient %s 2>/dev/null || true\n"
-			 "/usr/sbin/iw dev %s link >> " CONNECT_FILE " 2>&1",
-			 mon->cmd_ssid, mon->cmd_pass,
-			 mon->ifname, mon->ifname, mon->ifname);
+		snprintf(cmd, 4096,
+			 "/usr/sbin/ip link set %s up 2>/dev/null; "
+			 "/usr/sbin/rfkill unblock all 2>/dev/null || true; "
+			 "rm -f " CONNECT_FILE "\n"
+			 "echo '=== WPA connect ===' >> " CONNECT_FILE "\n"
+			 "echo 'iface: %s' >> " CONNECT_FILE "\n"
+			 "echo 'ssid:  %s' >> " CONNECT_FILE "\n"
+			 "is_sae=0; "
+			 "/usr/sbin/iw dev %s scan 2>/dev/null | "
+			 "awk 'BEGIN{p=0} "
+			 "/^BSS /{p=0} "
+			 "/SSID: /{p=0} "
+			 "$0==\"\\tSSID: %s\"{p=1} "
+			 "p && /Authentication suites: SAE/{print \"SAE\"; exit}' | "
+			 "grep -q SAE && is_sae=1; "
+			 "echo \"security: $([ $is_sae -eq 1 ] && echo WPA3-SAE || echo WPA2-PSK)\" >> " CONNECT_FILE "\n"
+			 "echo '---' >> " CONNECT_FILE "\n"
+			 "if /usr/bin/nmcli -t -f RUNNING general 2>/dev/null | grep -q '^running$'; then \n"
+			 "  echo 'Using NetworkManager (nmcli) to connect' >> " CONNECT_FILE ";\n"
+			 "  /usr/bin/nmcli -t dev set %s managed yes >> " CONNECT_FILE " 2>&1 || true;\n"
+			 "  /usr/bin/nmcli -t radio wifi on >> " CONNECT_FILE " 2>&1 || true;\n"
+			 "  /usr/bin/nmcli -t dev disconnect %s >> " CONNECT_FILE " 2>&1 || true;\n"
+			 "  /usr/bin/nmcli -t dev wifi connect '%s' password '%s' ifname %s >> " CONNECT_FILE " 2>&1 || true;\n"
+			 "  echo '=== nmcli dev show ===' >> " CONNECT_FILE ";\n"
+			 "  /usr/bin/nmcli -t -f GENERAL.STATE,GENERAL.CONNECTION,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS dev show %s >> " CONNECT_FILE " 2>&1 || true;\n"
+			 "else \n"
+			 "if /usr/sbin/wpa_cli -i %s ping 2>/dev/null | grep -q PONG; then \n"
+			 "  echo 'Using existing wpa_supplicant (NetworkManager running)' >> " CONNECT_FILE ";\n"
+			 "  id=$(/usr/sbin/wpa_cli -i %s add_network 2>/dev/null | tail -n1);\n"
+			 "  echo \"netid=$id\" >> " CONNECT_FILE ";\n"
+			 "  /usr/sbin/wpa_cli -i %s set_network \"$id\" ssid '\"%s\"' >> " CONNECT_FILE " 2>&1;\n"
+			 "  if [ $is_sae -eq 1 ]; then \n"
+			 "    /usr/sbin/wpa_cli -i %s set_network \"$id\" key_mgmt SAE >> " CONNECT_FILE " 2>&1;\n"
+			 "    /usr/sbin/wpa_cli -i %s set_network \"$id\" ieee80211w 2 >> " CONNECT_FILE " 2>&1;\n"
+			 "    /usr/sbin/wpa_cli -i %s set_network \"$id\" sae_password '\"%s\"' >> " CONNECT_FILE " 2>&1;\n"
+			 "  else \n"
+			 "    /usr/sbin/wpa_cli -i %s set_network \"$id\" key_mgmt WPA-PSK >> " CONNECT_FILE " 2>&1;\n"
+			 "    /usr/sbin/wpa_cli -i %s set_network \"$id\" psk '\"%s\"' >> " CONNECT_FILE " 2>&1;\n"
+			 "  fi;\n"
+			 "  /usr/sbin/wpa_cli -i %s enable_network \"$id\" >> " CONNECT_FILE " 2>&1;\n"
+			 "  /usr/sbin/wpa_cli -i %s select_network \"$id\" >> " CONNECT_FILE " 2>&1;\n"
+			 "else \n"
+			 "  echo 'Starting private wpa_supplicant instance' >> " CONNECT_FILE ";\n"
+			 "  /usr/bin/pkill -x wpa_supplicant 2>/dev/null || true;\n"
+			 "  rm -f /var/run/wpa_supplicant/%s 2>/dev/null || true;\n"
+			 "  ( \n"
+			 "    echo 'ctrl_interface=/var/run/wpa_supplicant'; \n"
+			 "    echo 'update_config=0'; \n"
+			 "    echo 'network={'; \n"
+			 "    echo \"    ssid=\\\"%s\\\"\"; \n"
+			 "    if [ $is_sae -eq 1 ]; then \n"
+			 "      echo \"    sae_password=\\\"%s\\\"\"; \n"
+			 "      echo '    key_mgmt=SAE'; \n"
+			 "      echo '    ieee80211w=2'; \n"
+			 "    else \n"
+			 "      echo \"    psk=\\\"%s\\\"\"; \n"
+			 "      echo '    key_mgmt=WPA-PSK'; \n"
+			 "    fi; \n"
+			 "    echo '}'; \n"
+			 "  ) > /tmp/.rtl8188_wpa.conf \n"
+			 "  /usr/sbin/wpa_supplicant -B -i %s "
+			 "  -c /tmp/.rtl8188_wpa.conf -D nl80211,wext "
+			 "  -f " CONNECT_FILE " >/dev/null 2>&1 || true;\n"
+			 "fi\n"
+			 "fi\n"
+			 "echo '=== wait for link (up to 20s) ===' >> " CONNECT_FILE "\n"
+			 "i=0; while [ $i -lt 20 ]; do "
+			 "  /usr/sbin/iw dev %s link 2>&1 | tee -a " CONNECT_FILE " | grep -q 'Connected to' && break; "
+			 "  sleep 1; i=$((i+1)); "
+			 "done\n"
+			 "echo '=== wpa_cli status ===' >> " CONNECT_FILE "\n"
+			 "/usr/sbin/wpa_cli -p /var/run/wpa_supplicant -i %s status 2>&1 >> " CONNECT_FILE " || true\n"
+			 "echo '=== nmcli (ip via NetworkManager) ===' >> " CONNECT_FILE "\n"
+			 "/usr/bin/nmcli -t -f GENERAL.STATE,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS dev show %s >> " CONNECT_FILE " 2>&1 || true\n"
+			 "echo '=== ip addr ===' >> " CONNECT_FILE "\n"
+			 "/usr/sbin/ip -br addr show %s 2>&1 >> " CONNECT_FILE " || true\n"
+			 "echo '=== final iw link ===' >> " CONNECT_FILE "\n"
+			 "/usr/sbin/iw dev %s link 2>&1 >> " CONNECT_FILE,
+			 /* ip link up */ mon->ifname,
+			 /* info lines */ mon->ifname, mon->cmd_ssid,
+			 /* scan detect */ mon->ifname, mon->cmd_ssid,
+			 /* nmcli managed yes */ mon->ifname,
+			 /* nmcli disconnect */ mon->ifname,
+			 /* nmcli wifi connect ssid/pass/if */ mon->cmd_ssid, mon->cmd_pass, mon->ifname,
+			 /* nmcli dev show */ mon->ifname,
+			 /* ping */ mon->ifname,
+			 /* add_network */ mon->ifname,
+			 /* set ssid */ mon->ifname, mon->cmd_ssid,
+			 /* SAE key_mgmt */ mon->ifname,
+			 /* SAE ieee80211w */ mon->ifname,
+			 /* SAE password */ mon->ifname, mon->cmd_pass,
+			 /* PSK key_mgmt */ mon->ifname,
+			 /* PSK password */ mon->ifname, mon->cmd_pass,
+			 /* enable/select */ mon->ifname, mon->ifname,
+			 /* rm stale sock */ mon->ifname,
+			 /* private conf ssid */ mon->cmd_ssid,
+			 /* private conf sae_password */ mon->cmd_pass,
+			 /* private conf psk */ mon->cmd_pass,
+			 /* private start -i */ mon->ifname,
+			 /* poll link */ mon->ifname,
+			 /* wpa_cli status */ mon->ifname,
+			 /* nmcli dev show */ mon->ifname,
+			 /* ip addr */ mon->ifname,
+			 /* final link */ mon->ifname);
 	} else {
 		/* Open network */
-		snprintf(cmd, sizeof(cmd),
+		snprintf(cmd, 4096,
+			 "/usr/sbin/ip link set %s up 2>/dev/null; "
+			 "/usr/sbin/rfkill unblock all 2>/dev/null || true; "
 			 "/usr/sbin/iw dev %s connect '%s' "
-			 "2>&1 > " CONNECT_FILE "\n"
-			 "sleep 1\n"
-			 "/usr/sbin/iw dev %s link >> " CONNECT_FILE " 2>&1",
-			 mon->ifname, mon->cmd_ssid, mon->ifname);
+			 "> " CONNECT_FILE " 2>&1\n"
+			 "echo '=== wait for link (up to 10s) ===' >> " CONNECT_FILE "\n"
+			 "i=0; while [ $i -lt 10 ]; do "
+			 "  /usr/sbin/iw dev %s link 2>&1 | tee -a " CONNECT_FILE " | grep -q 'Connected to' && break; "
+			 "  sleep 1; i=$((i+1)); "
+			 "done\n"
+			 "echo '=== nmcli (ip via NetworkManager) ===' >> " CONNECT_FILE "\n"
+			 "/usr/bin/nmcli -t -f GENERAL.STATE,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS dev show %s >> " CONNECT_FILE " 2>&1 || true\n"
+			 "echo '=== ip addr ===' >> " CONNECT_FILE "\n"
+			 "/usr/sbin/ip -br addr show %s 2>&1 >> " CONNECT_FILE " || true\n"
+			 "echo '=== final iw link ===' >> " CONNECT_FILE "\n"
+			 "/usr/sbin/iw dev %s link 2>&1 >> " CONNECT_FILE,
+			 mon->ifname,   /* ip link set %s up */
+			 mon->ifname,   /* iw dev %s connect */
+			 mon->cmd_ssid, /* ssid */
+			 mon->ifname,   /* poll: iw dev %s link */
+			 mon->ifname,   /* nmcli dev show %s */
+			 mon->ifname,   /* ip addr show %s */
+			 mon->ifname);  /* final iw dev %s link */
 	}
 
 	run_cmd(cmd);
+	kfree(cmd);
 
 	mutex_lock(&mon->cmd_lock);
 	n = 0;
@@ -1026,7 +1142,7 @@ static ssize_t rtl8188_dev_read(struct file *f, char __user *buf,
 			return -EAGAIN;
 		ret = wait_event_interruptible_timeout(
 			mon->resp_wq, mon->resp_ready,
-			msecs_to_jiffies(20000));
+			msecs_to_jiffies(60000));
 		if (ret == 0)
 			return -ETIMEDOUT;
 		if (ret < 0)

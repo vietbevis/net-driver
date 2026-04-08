@@ -509,6 +509,8 @@ static void draw_tab_status(int top, int bot, int cols)
 	}
 }
 
+/* (connect tab uses synchronous connect; no background refresh) */
+
 /* ================================================================
  * Tab: Monitor (F4) — auto-refreshing stats + bar chart
  * ================================================================ */
@@ -877,6 +879,7 @@ static void draw_tab_connect(int top, int bot, int cols)
 	mvprintw(top + 4, mid + 3, "SSID:");
 	mvprintw(top + 6, mid + 3, "Password:");
 	mvprintw(top + 9, mid + 3, "[Enter] Connect  [Tab] Switch field");
+	mvprintw(top + 10, mid + 3, "Waiting for final result (may take ~20-60s)");
 
 	/* SSID field */
 	if (g_connect_field == 0)
@@ -954,7 +957,7 @@ static void handle_connect_input(int ch)
 				 "%.*s", clen, g_resp);
 		} else {
 			snprintf(g_connect_msg, sizeof(g_connect_msg),
-				 "ERROR: No response from module");
+				 "ERROR: No response from module (connect still may be running)");
 		}
 	} else if (isprint(ch) && len < maxlen) {
 		field[len] = ch;
@@ -1020,7 +1023,7 @@ static void tui_main(void)
 		draw_header(cols);
 		draw_menu(cols);
 
-		/* Auto-refresh for monitor tab every 2s */
+		/* Auto-refresh every 2s for live tabs */
 		if (g_tab == TAB_MONITOR || g_tab == TAB_CAPTURE) {
 			time_t now = time(NULL);
 			if (now - last_refresh >= 2) {
@@ -1063,7 +1066,9 @@ static void tui_main(void)
 
 		case 's':
 		case 'S':
-			if (g_tab == TAB_SCAN) {
+			if (g_tab == TAB_CONNECT) {
+				handle_connect_input(ch);
+			} else if (g_tab == TAB_SCAN) {
 				/* Clear content area and show scanning message */
 				int sy;
 				for (sy = content_top + 1; sy < content_bot; sy++)
@@ -1083,12 +1088,17 @@ static void tui_main(void)
 
 		case 'r':
 		case 'R':
-			last_refresh = 0;
+			if (g_tab == TAB_CONNECT)
+				handle_connect_input(ch);
+			else
+				last_refresh = 0;
 			break;
 
 		case 'm':
 		case 'M':
-			if (g_tab == TAB_MONITOR) {
+			if (g_tab == TAB_CONNECT) {
+				handle_connect_input(ch);
+			} else if (g_tab == TAB_MONITOR) {
 				if (g_monitor_on) {
 					dev_command("monitor off", g_resp, BUF_SIZE);
 					g_monitor_on = 0;
@@ -1118,7 +1128,9 @@ static void tui_main(void)
 			break;
 
 		case 'f':
-			if (g_tab == TAB_MONITOR || g_tab == TAB_CAPTURE) {
+			if (g_tab == TAB_CONNECT) {
+				handle_connect_input(ch);
+			} else if (g_tab == TAB_MONITOR || g_tab == TAB_CAPTURE) {
 				int port = tui_prompt_port(rows, cols);
 				if (port >= 0 && port <= 65535) {
 					char fcmd[32];
@@ -1131,7 +1143,9 @@ static void tui_main(void)
 			break;
 
 		case 'F':
-			if (g_tab == TAB_MONITOR || g_tab == TAB_CAPTURE) {
+			if (g_tab == TAB_CONNECT) {
+				handle_connect_input(ch);
+			} else if (g_tab == TAB_MONITOR || g_tab == TAB_CAPTURE) {
 				dev_command("filter 0", g_resp, BUF_SIZE);
 				g_filter_port = 0;
 			}
@@ -1139,7 +1153,9 @@ static void tui_main(void)
 
 		case 'd':
 		case 'D':
-			if (g_tab == TAB_STATUS) {
+			if (g_tab == TAB_CONNECT) {
+				handle_connect_input(ch);
+			} else if (g_tab == TAB_STATUS) {
 				dev_command("disconnect", g_resp, BUF_SIZE);
 			}
 			break;

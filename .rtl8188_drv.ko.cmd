@@ -1,0 +1,1 @@
+savedcmd_/root/net-driver/rtl8188_drv.ko := ld -r -EL  -maarch64linux -z norelro -z noexecstack --no-warn-rwx-segments --build-id=sha1  -T scripts/module.lds -o /root/net-driver/rtl8188_drv.ko /root/net-driver/rtl8188_drv.o /root/net-driver/rtl8188_drv.mod.o /root/net-driver/.module-common.o

@@ -1,0 +1,1 @@
+savedcmd_/root/net-driver/rtl8188_drv.mod := printf '%s\n'   rtl8188_main.o rtl8188_hw.o rtl8188_phy.o rtl8188_mac.o rtl8188_trx.o | awk '!x[$$0]++ { print("/root/net-driver/"$$0) }' > /root/net-driver/rtl8188_drv.mod

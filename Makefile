@@ -2,47 +2,66 @@ KVER ?= $(shell uname -r)
 KDIR ?= /lib/modules/$(KVER)/build
 PWD  := $(shell pwd)
 
-MODULE := rtl8188_drv
+MODULE := rtl8188_mon
+CLI    := rtl8188_cli
 
 obj-m := $(MODULE).o
-$(MODULE)-objs := rtl8188_main.o rtl8188_hw.o rtl8188_phy.o \
-                  rtl8188_mac.o rtl8188_trx.o
 
-all:
+.PHONY: all module cli clean load unload reload status help
+
+all: module cli
+
+module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+cli: $(CLI).c
+	gcc -Wall -O2 -o $(CLI) $(CLI).c -lncurses
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f $(CLI)
 
 load: all
-	@echo "[*] Unloading system drivers..."
-	-rmmod rtl8xxxu 2>/dev/null
-	-rmmod r8188eu 2>/dev/null
-	@echo "[*] Loading dependencies..."
-	-modprobe mac80211 2>/dev/null
-	-modprobe cfg80211 2>/dev/null
-	@echo "[*] Loading $(MODULE).ko..."
+	@echo "=== Loading RTL8188 Companion Monitor ==="
+	@echo "[1] Ensuring system driver (rtl8xxxu) is loaded..."
+	-modprobe rtl8xxxu 2>/dev/null
+	@echo "[2] Loading companion monitor module..."
+	-rmmod $(MODULE) 2>/dev/null
 	insmod $(MODULE).ko
-	@echo "[+] Driver loaded."
+	@sleep 1
+	@echo "[3] Done! Device: /dev/rtl8188  Proc: /proc/rtl8188/"
+	@echo ""
+	@echo "Launch TUI:     ./$(CLI)"
+	@echo "CLI mode:       ./$(CLI) scan|info|status|stats|capture"
+	@echo "Connect WiFi:   ./$(CLI) connect SSID [password]"
 
 unload:
-	@echo "[*] Unloading $(MODULE)..."
+	@echo "=== Unloading RTL8188 Companion Monitor ==="
 	-rmmod $(MODULE) 2>/dev/null
-	@echo "[+] Driver unloaded."
+	@echo "Done. System driver (rtl8xxxu) is still active."
 
 reload: unload load
 
 status:
-	@echo "=== Module status ==="
-	@lsmod | grep -E "rtl8188|rtl8xxxu|cfg80211|mac80211" || true
+	@echo "=== Module Status ==="
+	@lsmod | grep -E "rtl8188|rtl8xxxu|cfg80211|mac80211" || echo "(none loaded)"
 	@echo ""
-	@echo "=== USB device ==="
-	@lsusb | grep 0bda || true
+	@echo "=== USB Device ==="
+	@lsusb | grep 0bda:0179 || echo "(not found)"
 	@echo ""
-	@echo "=== Network interface ==="
-	@ip link show 2>/dev/null | grep -A1 -E "wlan|wlp|wlx" || true
+	@echo "=== Char Device ==="
+	@ls -la /dev/rtl8188 2>/dev/null || echo "/dev/rtl8188 not found"
 	@echo ""
-	@echo "=== Recent dmesg ==="
-	@dmesg 2>/dev/null | grep -i "RTL8188" | tail -20 || true
+	@echo "=== Proc Entries ==="
+	@ls /proc/rtl8188/ 2>/dev/null || echo "/proc/rtl8188/ not found"
 
-.PHONY: all clean load unload reload status
+help:
+	@echo "Makefile targets:"
+	@echo "  make          - Build kernel module + TUI dashboard"
+	@echo "  make module   - Build kernel module only"
+	@echo "  make cli      - Build TUI/CLI tool only"
+	@echo "  make load     - Load module (keeps rtl8xxxu running)"
+	@echo "  make unload   - Unload module"
+	@echo "  make reload   - Unload + load"
+	@echo "  make status   - Show current status"
+	@echo "  make clean    - Clean build artifacts"

@@ -11,6 +11,7 @@
  */
 
 #include "rtl8188_cli.h"
+#include <locale.h>
 
 /* ================================================================
  * Nhãn tab bar
@@ -33,8 +34,10 @@ int  g_resp_len;
 struct ap_entry g_aps[MAX_APS]; /* Danh sách AP từ kết quả scan */
 int  g_ap_count   = 0;
 int  g_scan_scroll = 0;         /* Vị trí cuộn danh sách AP */
+char g_scan_msg[256] = {0};     /* Thông báo sau lần scan gần nhất */
 
 int  g_cap_scroll  = 0;         /* Con trỏ chọn gói trong capture list */
+int  g_cap_paused  = 0;         /* Pause list updates in F5 */
 int  g_monitor_on  = 0;         /* 1 nếu monitor đang bật */
 int  g_filter_port = 0;         /* Cổng đang filter, 0 = tất cả */
 
@@ -355,6 +358,9 @@ void tui_main(void)
 	int content_top, content_bot;
 	time_t last_refresh = 0;
 
+	/* Enable UTF-8 / Vietnamese rendering if terminal supports it */
+	setlocale(LC_ALL, "");
+
 	initscr();
 	cbreak();
 	noecho();
@@ -432,8 +438,23 @@ void tui_main(void)
 				refresh();
 				/* Block đến khi scan hoàn tất (có thể 5-10s) */
 				g_resp_len = dev_command("scan", g_resp, BUF_SIZE);
-				if (g_resp_len > 0)
+				/* Lưu lại thông báo 1 dòng để UI không bị nháy về hint */
+				g_scan_msg[0] = '\0';
+				if (g_resp_len > 0) {
+					char *nl = strchr(g_resp, '\n');
+					int clen = nl ? (int)(nl - g_resp) : g_resp_len;
+					if (clen > (int)sizeof(g_scan_msg) - 1)
+						clen = (int)sizeof(g_scan_msg) - 1;
+					snprintf(g_scan_msg, sizeof(g_scan_msg),
+						 "%.*s", clen, g_resp);
 					parse_scan_results(g_resp);
+					if (g_ap_count == 0 && g_scan_msg[0] == '\0')
+						snprintf(g_scan_msg, sizeof(g_scan_msg),
+							 "Không tìm thấy AP nào (hoặc scan bị chặn).");
+				} else {
+					snprintf(g_scan_msg, sizeof(g_scan_msg),
+						 "Scan không có phản hồi từ module.");
+				}
 				g_scan_scroll = 0;
 			}
 			break;
@@ -441,8 +462,19 @@ void tui_main(void)
 		case 'r': case 'R':
 			if (g_tab == TAB_CONNECT)
 				handle_connect_input(ch);
-			else
+			else {
+				/* In capture tab, treat refresh as "resume + refresh now" */
+				if (g_tab == TAB_CAPTURE)
+					g_cap_paused = 0;
 				last_refresh = 0;  /* Force refresh ngay lần tiếp */
+			}
+			break;
+
+		case 'p': case 'P':
+			if (g_tab == TAB_CAPTURE)
+				g_cap_paused = !g_cap_paused;
+			else if (g_tab == TAB_CONNECT)
+				handle_connect_input(ch);
 			break;
 
 		case 'm': case 'M':
@@ -463,19 +495,23 @@ void tui_main(void)
 		case KEY_UP:
 			if (g_tab == TAB_SCAN && g_scan_scroll > 0)
 				g_scan_scroll--;
-			else if (g_tab == TAB_CAPTURE && g_cap_scroll > 0)
+			else if (g_tab == TAB_CAPTURE && g_cap_scroll > 0) {
 				g_cap_scroll--;
-			else if (g_tab == TAB_CONNECT)
+				g_cap_paused = 1;
+			} else if (g_tab == TAB_CONNECT) {
 				handle_connect_input(ch);
+			}
 			break;
 
 		case KEY_DOWN:
 			if (g_tab == TAB_SCAN)
 				g_scan_scroll++;
-			else if (g_tab == TAB_CAPTURE)
+			else if (g_tab == TAB_CAPTURE) {
 				g_cap_scroll++;
-			else if (g_tab == TAB_CONNECT)
+				g_cap_paused = 1;
+			} else if (g_tab == TAB_CONNECT) {
 				handle_connect_input(ch);
+			}
 			break;
 
 		case 'f':
@@ -511,8 +547,12 @@ void tui_main(void)
 			break;
 
 		default:
-			if (g_tab == TAB_CONNECT)
-				handle_connect_input(ch);
+			if (g_tab == TAB_CONNECT) {
+				if (ch == '\n' || ch == KEY_ENTER)
+					connect_submit_and_wait(content_top, content_bot, cols);
+				else
+					handle_connect_input(ch);
+			}
 			break;
 		}
 	}

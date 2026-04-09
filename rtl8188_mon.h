@@ -128,6 +128,9 @@ struct pkt_entry {
 	u8  payload[PAYLOAD_SNAP_SIZE];
 	int payload_len;
 
+	/* Best-effort domain/host (DNS map / HTTP Host / TLS SNI). UTF-8 bytes. */
+	char domain[80];
+
 	/* 1 nếu src hoặc dst port là CHAT_PORT (9090) hoặc nội dung là chat_frame */
 	int is_chat;
 

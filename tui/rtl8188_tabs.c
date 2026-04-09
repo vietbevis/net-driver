@@ -257,8 +257,15 @@ void draw_tab_scan(int top, int bot, int cols)
 
 	if (g_ap_count == 0) {
 		attron(COLOR_PAIR(CP_TABLE_HDR));
-		mvprintw(top + 2, 3, "%-*s", cols - 6,
-			 "Nhấn 's' để quét WiFi");
+		if (g_scan_msg[0]) {
+			mvprintw(top + 2, 3, "%-*.*s", cols - 6, cols - 6,
+				 g_scan_msg);
+			mvprintw(top + 4, 3, "%-*s", cols - 6,
+				 "Nhấn 's' để quét lại");
+		} else {
+			mvprintw(top + 2, 3, "%-*s", cols - 6,
+				 "Nhấn 's' để quét WiFi");
+		}
 		attroff(COLOR_PAIR(CP_TABLE_HDR));
 		return;
 	}
@@ -619,10 +626,12 @@ void draw_tab_capture(int top, int bot, int cols)
 {
 	int split, sel;
 
-	/* Lấy và parse dữ liệu capture mới nhất */
-	g_resp_len = dev_command("capture", g_resp, BUF_SIZE);
-	if (g_resp_len > 0)
-		parse_capture_output(g_resp);
+	/* Lấy và parse dữ liệu capture mới nhất (trừ khi đang pause để chọn gói) */
+	if (!g_cap_paused) {
+		g_resp_len = dev_command("capture", g_resp, BUF_SIZE);
+		if (g_resp_len > 0)
+			parse_capture_output(g_resp);
+	}
 
 	/* Giới hạn con trỏ chọn trong phạm vi hợp lệ */
 	sel = g_cap_scroll;
@@ -654,13 +663,14 @@ void draw_tab_capture(int top, int bot, int cols)
 	attron(COLOR_PAIR(CP_MENU));
 	if (g_filter_port > 0)
 		mvprintw(bot - 1, 1,
-			 " UP/DN:chọn | r:refresh | f:filter(%d) | F:xóa"
+			 " UP/DN:chọn | p:pause(%s) | r:refresh | f:filter(%d) | F:xóa"
 			 " | IV=lá HMAC=tím ENC=đỏ(mã hóa) ",
-			 g_filter_port);
+			 g_cap_paused ? "on" : "off", g_filter_port);
 	else
 		mvprintw(bot - 1, 1,
-			 " UP/DN:chọn | r:refresh | f:đặt filter"
-			 " | IV=lá HMAC=tím ENC=đỏ(ciphertext) ");
+			 " UP/DN:chọn | p:pause(%s) | r:refresh | f:đặt filter"
+			 " | IV=lá HMAC=tím ENC=đỏ(ciphertext) ",
+			 g_cap_paused ? "on" : "off");
 	attroff(COLOR_PAIR(CP_MENU));
 }
 
@@ -765,23 +775,96 @@ void handle_connect_input(int ch)
 
 		snprintf(g_connect_msg, sizeof(g_connect_msg),
 			 "Đang kết nối đến %s ...", g_ssid);
-		refresh();
-
-		/* Block chờ kết quả từ kernel (connect_work_fn) */
-		g_resp_len = dev_command(cmd, g_resp, BUF_SIZE);
-		if (g_resp_len > 0) {
-			char *nl   = strchr(g_resp, '\n');
-			int   clen = nl ? (int)(nl - g_resp) : g_resp_len;
-			if (clen > 200) clen = 200;
-			snprintf(g_connect_msg, sizeof(g_connect_msg),
-				 "%.*s", clen, g_resp);
-		} else {
-			snprintf(g_connect_msg, sizeof(g_connect_msg),
-				 "ERROR: Không nhận được phản hồi từ module");
-		}
+		/* Actual blocking connect is handled in tui loop so UI can redraw first. */
 
 	} else if (isprint(ch) && len < maxlen) {
 		field[len]     = ch;
 		field[len + 1] = '\0';
 	}
+}
+
+static void connect_set_msg_from_result(const char *buf, int len)
+{
+	const char *p;
+	char ip[32] = {0};
+
+	if (!buf || len <= 0) {
+		snprintf(g_connect_msg, sizeof(g_connect_msg),
+			 "ERROR: Không nhận được phản hồi từ module");
+		return;
+	}
+
+	/* Prefer IP from nmcli output */
+	p = strstr(buf, "IP4.ADDRESS");
+	if (p) {
+		/* find ':' then copy to end of line */
+		p = strchr(p, ':');
+		if (p) {
+			int i = 0;
+			p++;
+			while (*p == ' ' || *p == '\t') p++;
+			while (*p && *p != '\n' && i < (int)sizeof(ip) - 1)
+				ip[i++] = *p++;
+			ip[i] = '\0';
+		}
+	}
+
+	if (strstr(buf, "GENERAL.STATE:100") || strstr(buf, "Connected to")) {
+		if (ip[0])
+			snprintf(g_connect_msg, sizeof(g_connect_msg),
+				 "Đã kết nối. %s", ip);
+		else
+			snprintf(g_connect_msg, sizeof(g_connect_msg),
+				 "Đã kết nối (chưa thấy IP)");
+		return;
+	}
+
+	/* Find a useful error line */
+	p = strstr(buf, "Error:");
+	if (p) {
+		const char *eol = strchr(p, '\n');
+		int n = eol ? (int)(eol - p) : 0;
+		if (n <= 0 || n > 200) n = 200;
+		snprintf(g_connect_msg, sizeof(g_connect_msg),
+			 "%.*s", n, p);
+		return;
+	}
+
+	/* Fallback to first line */
+	{
+		const char *eol = memchr(buf, '\n', len);
+		int n = eol ? (int)(eol - buf) : len;
+		if (n > 200) n = 200;
+		snprintf(g_connect_msg, sizeof(g_connect_msg),
+			 "%.*s", n, buf);
+	}
+}
+
+void connect_submit_and_wait(int top, int bot, int cols)
+{
+	char cmd[256];
+
+	if (g_ssid[0] == '\0') {
+		snprintf(g_connect_msg, sizeof(g_connect_msg),
+			 "ERROR: SSID không được để trống");
+		return;
+	}
+
+	if (g_pass[0])
+		snprintf(cmd, sizeof(cmd), "connect %s %s", g_ssid, g_pass);
+	else
+		snprintf(cmd, sizeof(cmd), "connect %s", g_ssid);
+
+	snprintf(g_connect_msg, sizeof(g_connect_msg),
+		 "Đang kết nối đến %s ...", g_ssid);
+
+	/* Force redraw BEFORE blocking dev_command() */
+	draw_header(cols);
+	draw_menu(cols);
+	draw_tab_connect(top, bot, cols);
+	draw_status_bar(bot + 1, cols);
+	refresh();
+
+	g_resp_len = dev_command(cmd, g_resp, BUF_SIZE);
+	connect_set_msg_from_result(g_resp, g_resp_len);
 }

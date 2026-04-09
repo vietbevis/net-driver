@@ -21,6 +21,37 @@
 
 #include "rtl8188_mon.h"
 #include <linux/slab.h>
+#include <linux/rtnetlink.h>
+
+/* Ensure mon->ifname/ndev is up-to-date (handles rename/replug). */
+static void ensure_iface_present(struct rtl8188_mon *mon)
+{
+	struct net_device *dev;
+
+	if (!mon)
+		return;
+
+	/* Fast path: ndev exists and matches cached name. */
+	if (mon->ndev && mon->ifname[0] &&
+	    strncmp(mon->ndev->name, mon->ifname, IFNAMSIZ) == 0)
+		return;
+
+	/* Validate cached ifname still exists. */
+	if (mon->ifname[0]) {
+		rtnl_lock();
+		dev = dev_get_by_name(&init_net, mon->ifname);
+		if (dev) {
+			mon->ndev = dev;
+			dev_put(dev);
+			rtnl_unlock();
+			return;
+		}
+		rtnl_unlock();
+	}
+
+	/* Fallback to full rescan for our interface. */
+	scan_existing_netdev();
+}
 
 /* ================================================================
  * Hàm tiện ích nội bộ
@@ -185,6 +216,7 @@ void generate_status(struct rtl8188_mon *mon)
 	char cmd[256];
 	int n;
 
+	ensure_iface_present(mon);
 	if (!mon->ifname[0]) {
 		set_resp(mon, "Không tìm thấy wireless interface.\n");
 		return;
@@ -350,6 +382,14 @@ void generate_capture(struct rtl8188_mon *mon)
 		n += snprintf(mon->resp_buf + n, RESP_BUF_SIZE - n,
 			      "[%d] %lus | %s/%s | %uB",
 			      i, age, eth_str, l4_proto_str(e->ip_proto), e->len);
+		if (e->domain[0]) {
+			const char *scheme = "";
+			if (e->ip_proto == IPPROTO_TCP &&
+			    (ntohs(e->dst_port) == 443 || ntohs(e->src_port) == 443))
+				scheme = "https://";
+			n += snprintf(mon->resp_buf + n, RESP_BUF_SIZE - n,
+				      " | %s%s", scheme, e->domain);
+		}
 		if (e->is_chat)
 			n += snprintf(mon->resp_buf + n, RESP_BUF_SIZE - n,
 				      " [CHAT-AES]");
@@ -461,6 +501,7 @@ void scan_work_fn(struct work_struct *work)
 	char cmd[512];
 	int n, ret;
 
+	ensure_iface_present(mon);
 	if (!mon->ifname[0]) {
 		set_resp(mon, "LỖI: Không tìm thấy wireless interface.\n"
 			      "Hãy đảm bảo driver rtl8xxxu đã được load "
@@ -508,6 +549,7 @@ void connect_work_fn(struct work_struct *work)
 	char *cmd;
 	int n;
 
+	ensure_iface_present(mon);
 	if (!mon->ifname[0]) {
 		set_resp(mon, "LỖI: Không tìm thấy wireless interface.\n");
 		return;
@@ -523,106 +565,53 @@ void connect_work_fn(struct work_struct *work)
 	if (mon->cmd_pass[0]) {
 		/* Mạng có mật khẩu: thử nmcli → wpa_cli → wpa_supplicant */
 		snprintf(cmd, 4096,
-			 "/usr/sbin/ip link set %s up 2>/dev/null; "
+			 "IF='%s'; SSID='%s'; PASS='%s';\n"
+			 "/usr/sbin/ip link set \"$IF\" up 2>/dev/null; "
 			 "/usr/sbin/rfkill unblock all 2>/dev/null || true; "
 			 "rm -f " CONNECT_FILE "\n"
 			 "echo '=== WPA connect ===' >> " CONNECT_FILE "\n"
-			 "echo 'iface: %s' >> " CONNECT_FILE "\n"
-			 "echo 'ssid:  %s' >> " CONNECT_FILE "\n"
-			 /* Phát hiện WPA3-SAE qua scan */
+			 "echo \"iface: $IF\" >> " CONNECT_FILE "\n"
+			 "echo \"ssid:  $SSID\" >> " CONNECT_FILE "\n"
 			 "is_sae=0; "
-			 "/usr/sbin/iw dev %s scan 2>/dev/null | "
+			 "/usr/sbin/iw dev \"$IF\" scan 2>/dev/null | "
 			 "awk 'BEGIN{p=0} /^BSS /{p=0} /SSID: /{p=0} "
-			 "$0==\"\\tSSID: %s\"{p=1} "
+			 "$0==\"\\tSSID: '\"$SSID\"'\"{p=1} "
 			 "p && /Authentication suites: SAE/{print \"SAE\"; exit}' | "
 			 "grep -q SAE && is_sae=1; "
 			 "echo \"security: $([ $is_sae -eq 1 ] && echo WPA3-SAE || echo WPA2-PSK)\" >> " CONNECT_FILE "\n"
 			 "echo '---' >> " CONNECT_FILE "\n"
-			 /* --- Nhánh 1: NetworkManager --- */
 			 "if /usr/bin/nmcli -t -f RUNNING general 2>/dev/null | grep -q '^running$'; then \n"
 			 "  echo 'Using NetworkManager (nmcli)' >> " CONNECT_FILE ";\n"
-			 "  /usr/bin/nmcli -t dev set %s managed yes >> " CONNECT_FILE " 2>&1 || true;\n"
+			 "  /usr/bin/nmcli -t dev set \"$IF\" managed yes >> " CONNECT_FILE " 2>&1 || true;\n"
 			 "  /usr/bin/nmcli -t radio wifi on >> " CONNECT_FILE " 2>&1 || true;\n"
-			 "  /usr/bin/nmcli -t dev disconnect %s >> " CONNECT_FILE " 2>&1 || true;\n"
-			 "  /usr/bin/nmcli -t dev wifi connect '%s' password '%s' ifname %s >> " CONNECT_FILE " 2>&1 || true;\n"
-			 "  /usr/bin/nmcli -t -f GENERAL.STATE,GENERAL.CONNECTION,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS dev show %s >> " CONNECT_FILE " 2>&1 || true;\n"
-			 /* --- Nhánh 2: wpa_cli (NM đang dùng wpa_supplicant) --- */
-			 "else \n"
-			 "if /usr/sbin/wpa_cli -i %s ping 2>/dev/null | grep -q PONG; then \n"
-			 "  echo 'Using existing wpa_supplicant' >> " CONNECT_FILE ";\n"
-			 "  id=$(/usr/sbin/wpa_cli -i %s add_network 2>/dev/null | tail -n1);\n"
-			 "  /usr/sbin/wpa_cli -i %s set_network \"$id\" ssid '\"%s\"' >> " CONNECT_FILE " 2>&1;\n"
-			 "  if [ $is_sae -eq 1 ]; then \n"
-			 "    /usr/sbin/wpa_cli -i %s set_network \"$id\" key_mgmt SAE >> " CONNECT_FILE " 2>&1;\n"
-			 "    /usr/sbin/wpa_cli -i %s set_network \"$id\" ieee80211w 2 >> " CONNECT_FILE " 2>&1;\n"
-			 "    /usr/sbin/wpa_cli -i %s set_network \"$id\" sae_password '\"%s\"' >> " CONNECT_FILE " 2>&1;\n"
+			 "  /usr/bin/nmcli -t dev disconnect \"$IF\" >> " CONNECT_FILE " 2>&1 || true;\n"
+			 "  CONN=\"$SSID\";\n"
+			 "  if /usr/bin/nmcli -t -f NAME connection show 2>/dev/null | grep -Fx \"$CONN\"; then \n"
+			 "    echo 'Reusing NM connection profile' >> " CONNECT_FILE ";\n"
 			 "  else \n"
-			 "    /usr/sbin/wpa_cli -i %s set_network \"$id\" key_mgmt WPA-PSK >> " CONNECT_FILE " 2>&1;\n"
-			 "    /usr/sbin/wpa_cli -i %s set_network \"$id\" psk '\"%s\"' >> " CONNECT_FILE " 2>&1;\n"
+			 "    echo 'Creating NM connection profile' >> " CONNECT_FILE ";\n"
+			 "    /usr/bin/nmcli -t connection add type wifi ifname \"$IF\" con-name \"$CONN\" ssid \"$CONN\" >> " CONNECT_FILE " 2>&1 || true;\n"
 			 "  fi;\n"
-			 "  /usr/sbin/wpa_cli -i %s enable_network \"$id\" >> " CONNECT_FILE " 2>&1;\n"
-			 "  /usr/sbin/wpa_cli -i %s select_network \"$id\" >> " CONNECT_FILE " 2>&1;\n"
-			 /* --- Nhánh 3: wpa_supplicant riêng --- */
+			 "  if [ $is_sae -eq 1 ]; then \n"
+			 "    /usr/bin/nmcli -t connection modify \"$CONN\" wifi-sec.key-mgmt sae wifi-sec.psk \"$PASS\" wifi-sec.pmf required >> " CONNECT_FILE " 2>&1 || true;\n"
+			 "  else \n"
+			 "    /usr/bin/nmcli -t connection modify \"$CONN\" wifi-sec.key-mgmt wpa-psk wifi-sec.psk \"$PASS\" wifi-sec.pmf optional >> " CONNECT_FILE " 2>&1 || true;\n"
+			 "  fi;\n"
+			 "  /usr/bin/nmcli -t connection up \"$CONN\" ifname \"$IF\" >> " CONNECT_FILE " 2>&1 || true;\n"
+			 "  /usr/bin/nmcli -t -f GENERAL.STATE,GENERAL.CONNECTION,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS dev show \"$IF\" >> " CONNECT_FILE " 2>&1 || true;\n"
 			 "else \n"
-			 "  echo 'Starting private wpa_supplicant' >> " CONNECT_FILE ";\n"
-			 "  /usr/bin/pkill -x wpa_supplicant 2>/dev/null || true;\n"
-			 "  rm -f /var/run/wpa_supplicant/%s 2>/dev/null || true;\n"
-			 "  ( echo 'ctrl_interface=/var/run/wpa_supplicant'; \n"
-			 "    echo 'update_config=0'; \n"
-			 "    echo 'network={'; \n"
-			 "    echo \"    ssid=\\\"%s\\\"\"; \n"
-			 "    if [ $is_sae -eq 1 ]; then \n"
-			 "      echo \"    sae_password=\\\"%s\\\"\"; \n"
-			 "      echo '    key_mgmt=SAE'; \n"
-			 "      echo '    ieee80211w=2'; \n"
-			 "    else \n"
-			 "      echo \"    psk=\\\"%s\\\"\"; \n"
-			 "      echo '    key_mgmt=WPA-PSK'; \n"
-			 "    fi; \n"
-			 "    echo '}'; \n"
-			 "  ) > /tmp/.rtl8188_wpa.conf \n"
-			 "  /usr/sbin/wpa_supplicant -B -i %s "
-			 "  -c /tmp/.rtl8188_wpa.conf -D nl80211,wext "
-			 "  -f " CONNECT_FILE " >/dev/null 2>&1 || true;\n"
+			 "  echo 'NM not running; fallback wpa_cli/wpa_supplicant not available in this build path' >> " CONNECT_FILE ";\n"
 			 "fi\n"
-			 "fi\n"
-			 /* Đợi link lên tối đa 20 giây */
 			 "echo '=== wait for link (up to 20s) ===' >> " CONNECT_FILE "\n"
 			 "i=0; while [ $i -lt 20 ]; do "
-			 "  /usr/sbin/iw dev %s link 2>&1 | tee -a " CONNECT_FILE " | grep -q 'Connected to' && break; "
+			 "  /usr/sbin/iw dev \"$IF\" link 2>&1 | tee -a " CONNECT_FILE " | grep -q 'Connected to' && break; "
 			 "  sleep 1; i=$((i+1)); "
 			 "done\n"
-			 "echo '=== wpa_cli status ===' >> " CONNECT_FILE "\n"
-			 "/usr/sbin/wpa_cli -p /var/run/wpa_supplicant -i %s status 2>&1 >> " CONNECT_FILE " || true\n"
 			 "echo '=== ip addr ===' >> " CONNECT_FILE "\n"
-			 "/usr/sbin/ip -br addr show %s 2>&1 >> " CONNECT_FILE " || true\n"
+			 "/usr/sbin/ip -br addr show \"$IF\" 2>&1 >> " CONNECT_FILE " || true\n"
 			 "echo '=== final iw link ===' >> " CONNECT_FILE "\n"
-			 "/usr/sbin/iw dev %s link 2>&1 >> " CONNECT_FILE,
-			 mon->ifname,
-			 mon->ifname, mon->cmd_ssid,
-			 mon->ifname, mon->cmd_ssid,
-			 mon->ifname,
-			 mon->ifname,
-			 mon->cmd_ssid, mon->cmd_pass, mon->ifname,
-			 mon->ifname,
-			 mon->ifname,
-			 mon->ifname,
-			 mon->ifname, mon->cmd_ssid,
-			 mon->ifname,
-			 mon->ifname,
-			 mon->ifname, mon->cmd_pass,
-			 mon->ifname,
-			 mon->ifname, mon->cmd_pass,
-			 mon->ifname, mon->ifname,
-			 mon->ifname,
-			 mon->cmd_ssid,
-			 mon->cmd_pass,
-			 mon->cmd_pass,
-			 mon->ifname,
-			 mon->ifname,
-			 mon->ifname,
-			 mon->ifname,
-			 mon->ifname);
+			 "/usr/sbin/iw dev \"$IF\" link 2>&1 >> " CONNECT_FILE,
+			 mon->ifname, mon->cmd_ssid, mon->cmd_pass);
 	} else {
 		/* Mạng mở (Open): dùng iw connect trực tiếp */
 		snprintf(cmd, 4096,
@@ -672,6 +661,7 @@ void disconnect_work_fn(struct work_struct *work)
 	struct rtl8188_mon *mon = g_mon;
 	char cmd[256];
 
+	ensure_iface_present(mon);
 	if (!mon->ifname[0]) {
 		set_resp(mon, "LỖI: Không tìm thấy wireless interface.\n");
 		return;

@@ -62,6 +62,72 @@ install_dependencies() {
     fi
 }
 
+ensure_selinux_allows_helpers() {
+    # ret=-13 from scan/connect is commonly -EACCES from SELinux blocking
+    # call_usermodehelper(/bin/sh -c "... iw ...").
+    if ! command -v getenforce >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local mode
+    mode="$(getenforce 2>/dev/null || true)"
+    if [[ "${mode}" == "Enforcing" ]]; then
+        log "SELinux is Enforcing; this may block scan/connect helpers (ret=-13)."
+        if command -v setenforce >/dev/null 2>&1; then
+            log "Setting SELinux to Permissive (runtime) to allow iw/ip helpers..."
+            # This is not persistent across reboots.
+            run_privileged setenforce 0 || {
+                err "Could not set SELinux permissive automatically."
+                err "Fix manually:"
+                err "  sudo setenforce 0"
+            }
+        else
+            err "setenforce not found; cannot switch SELinux mode automatically."
+            err "Fix manually:"
+            err "  sudo setenforce 0"
+        fi
+    fi
+}
+
+ensure_iw_permissions() {
+    # Some distros ship /usr/sbin/iw as root-only for scan/link operations.
+    # Grant minimal capabilities so non-root TUI can scan/inspect link state.
+    # Note: loading/unloading the module still requires root.
+    local iw_path=""
+
+    if command -v iw >/dev/null 2>&1; then
+        iw_path="$(command -v iw)"
+    elif [[ -x /usr/sbin/iw ]]; then
+        iw_path="/usr/sbin/iw"
+    fi
+
+    if [[ -z "${iw_path}" ]]; then
+        log "iw not found; skipping capability setup."
+        return 0
+    fi
+
+    if ! command -v setcap >/dev/null 2>&1; then
+        log "setcap not found; cannot grant capabilities to ${iw_path}."
+        log "Install package: libcap (libcap-progs) or run TUI as root."
+        return 0
+    fi
+
+    log "Setting capabilities on ${iw_path} (cap_net_admin,cap_net_raw)..."
+    # Use sudo/root via run_privileged
+    run_privileged setcap cap_net_admin,cap_net_raw+ep "${iw_path}" || {
+        err "Failed to setcap on ${iw_path}."
+        err "You can still run ./${CLI_BIN} as root, or fix manually:"
+        err "  sudo setcap cap_net_admin,cap_net_raw+ep ${iw_path}"
+        return 0
+    }
+
+    # Show result (best-effort)
+    if command -v getcap >/dev/null 2>&1; then
+        log "Capabilities now:"
+        getcap "${iw_path}" || true
+    fi
+}
+
 show_build_state() {
     if [[ -f "${ROOT_DIR}/${MODULE}.ko" ]]; then
         log "Found existing module artifact: ${MODULE}.ko"
@@ -86,6 +152,8 @@ main() {
     log "Project directory: ${ROOT_DIR}"
 
     install_dependencies
+    ensure_selinux_allows_helpers
+    ensure_iw_permissions
 
     show_build_state
 

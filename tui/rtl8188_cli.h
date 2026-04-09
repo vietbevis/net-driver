@@ -122,9 +122,11 @@ extern int  g_resp_len;
 extern struct ap_entry g_aps[MAX_APS];
 extern int  g_ap_count;
 extern int  g_scan_scroll;   /* Vị trí cuộn trong danh sách AP */
+extern char g_scan_msg[256]; /* Thông báo sau lần scan gần nhất */
 
 /* Vị trí con trỏ trong danh sách gói capture */
 extern int  g_cap_scroll;
+extern int  g_cap_paused;  /* 1 = pause auto-refresh list to select stable */
 
 /* Trạng thái monitoring và filter port */
 extern int  g_monitor_on;
@@ -170,6 +172,7 @@ void draw_tab_connect(int top, int bot, int cols);
 
 /* Xử lý phím trong tab Connect */
 void handle_connect_input(int ch);
+void connect_submit_and_wait(int top, int bot, int cols);
 
 /* Parse kết quả iw scan thành mảng g_aps[] */
 void parse_scan_results(const char *raw);

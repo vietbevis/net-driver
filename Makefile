@@ -5,7 +5,45 @@ PWD  := $(shell pwd)
 MODULE := rtl8188_mon
 CLI    := rtl8188_cli
 
-obj-m := $(MODULE).o
+# -----------------------------------------------------------------------------
+# Kernel module (Kbuild section)
+# -----------------------------------------------------------------------------
+obj-m += $(MODULE).o
+
+$(MODULE)-objs := \
+	rtl8188_main.o \
+	rtl8188_usb.o \
+	rtl8188_netdev.o \
+	rtl8188_pkt.o \
+	rtl8188_cmd.o \
+	rtl8188_proc.o \
+	rtl8188_chrdev.o
+
+# -----------------------------------------------------------------------------
+# Userspace TUI/CLI build
+# -----------------------------------------------------------------------------
+CC ?= gcc
+CFLAGS ?= -O2 -Wall -Wextra
+PKG_CONFIG ?= pkg-config
+
+CLI_SRCS := \
+	tui/rtl8188_main_tui.c \
+	tui/rtl8188_tui.c \
+	tui/rtl8188_tabs.c
+
+CLI_CFLAGS := -I./tui
+
+# Prefer pkg-config if available; fallback for systems without .pc file.
+NCURSES_PKG := $(shell $(PKG_CONFIG) --exists ncursesw && echo ncursesw || \
+	$(PKG_CONFIG) --exists ncurses && echo ncurses || true)
+
+ifeq ($(NCURSES_PKG),)
+NCURSES_CFLAGS :=
+NCURSES_LIBS   := -lncursesw
+else
+NCURSES_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(NCURSES_PKG))
+NCURSES_LIBS   := $(shell $(PKG_CONFIG) --libs $(NCURSES_PKG))
+endif
 
 .PHONY: all module cli clean load unload reload status help
 
@@ -14,8 +52,17 @@ all: module cli
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
-cli: $(CLI).c
-	gcc -Wall -O2 -o $(CLI) $(CLI).c -lncurses
+cli: check-ncurses $(CLI)
+
+check-ncurses:
+	@printf '#include <ncurses.h>\n' | $(CC) -x c -E $(NCURSES_CFLAGS) - >/dev/null 2>&1 || { \
+		echo "Missing ncurses headers (ncurses.h)."; \
+		echo "Install dependency: dnf install ncurses-devel  (or apt install libncurses-dev)"; \
+		exit 1; \
+	}
+
+$(CLI): $(CLI_SRCS) tui/rtl8188_cli.h
+	$(CC) $(CFLAGS) $(CLI_CFLAGS) $(NCURSES_CFLAGS) -o $@ $(CLI_SRCS) $(NCURSES_LIBS)
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean

@@ -21,8 +21,19 @@ dnf install -y kernel-devel gcc make ncurses-devel iw
 
 ```
 net-driver/
-├── rtl8188_mon.c      Kernel module (1129 lines)
-├── rtl8188_cli.c      TUI dashboard + CLI tool (938 lines)
+├── rtl8188_main.c      Module init/exit + helper chung
+├── rtl8188_usb.c       USB notifier (detect 0bda:0179)
+├── rtl8188_netdev.c    Netdev notifier (track wlan iface)
+├── rtl8188_pkt.c       Packet monitor (ETH_P_ALL)
+├── rtl8188_cmd.c       Command handlers (scan/connect/stats/capture)
+├── rtl8188_proc.c      /proc/rtl8188/*
+├── rtl8188_chrdev.c    /dev/rtl8188
+├── rtl8188_mon.h       Header dùng chung cho kernel module
+├── tui/
+│   ├── rtl8188_main_tui.c   main + CLI mode
+│   ├── rtl8188_tui.c        TUI core loop + common drawing
+│   ├── rtl8188_tabs.c       Tab rendering + parsers
+│   └── rtl8188_cli.h        Header dùng chung cho userspace
 ├── Makefile            Build system
 ├── README.md           File này
 └── ARCHITECTURE.md     Kiến trúc chi tiết

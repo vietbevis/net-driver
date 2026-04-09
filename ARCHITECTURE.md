@@ -65,7 +65,7 @@ Hệ thống gồm 2 thành phần: **Kernel Module** (`rtl8188_mon.ko`) và **U
 
 ## Thành phần chi tiết
 
-### 1. Kernel Module (`rtl8188_mon.c`)
+### 1. Kernel Module (multi-file: `rtl8188_main.c` + `rtl8188_*.c`)
 
 #### 1.1 USB Device Detection
 
@@ -197,7 +197,7 @@ Tất cả async operations chạy trên `create_singlethread_workqueue("rtl8188
 
 Dùng `proc_create_single()` + `seq_file` interface.
 
-### 2. TUI Dashboard (`rtl8188_cli.c`)
+### 2. TUI Dashboard (multi-file: `tui/rtl8188_*.c`)
 
 ```
 main()
